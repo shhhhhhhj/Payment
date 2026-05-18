@@ -1,0 +1,956 @@
+import express from "express";
+import Stripe from "stripe";
+import { Resend } from "resend";
+import { createClient } from "@supabase/supabase-js";
+import cors from "cors";
+import bodyParser from "body-parser";
+
+// ----------------------------
+// CONFIG & INIT
+// ----------------------------
+const app = express();
+
+// Security Headers (Helmet-like basics)
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  next();
+});
+
+// CORS Configuration
+const allowedOrigins = [
+  "https://heloxai.xyz",
+  process.env.FRONTEND_URL // Supports env overrides (e.g., localhost)
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  methods: ["GET", "POST", "OPTIONS", "PUT", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+}));
+
+// ----------------------------
+// BODY PARSER STRATEGY
+// ----------------------------
+app.post("/stripe-webhook", bodyParser.raw({ type: "application/json" }));
+
+app.use((req, res, next) => {
+  if (req.path === '/stripe-webhook') {
+    return next();
+  }
+  express.json()(req, res, next);
+});
+
+// ----------------------------
+// SERVICES
+// ----------------------------
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2024-06-20",
+  typescript: true,
+});
+
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY 
+);
+
+// ----------------------------
+// ANALYTICS HELPER
+// ----------------------------
+function trackAnalytics(eventName, properties = {}) {
+  console.log(`[ANALYTICS] ${eventName}:`, JSON.stringify(properties));
+}
+
+// ----------------------------
+// AUDIT LOGGING HELPER
+// ----------------------------
+async function logAdminAction(adminId, action, targetId = null) {
+  try {
+    await supabase.from("admin_audit_logs").insert({
+      admin_id: adminId,
+      action: action,
+      target_id: targetId,
+    });
+  } catch (err) {
+    console.error("❌ Failed to log admin action:", err);
+  }
+}
+
+// ----------------------------
+// EMAIL HELPER
+// ----------------------------
+async function sendEmail(to, subject, htmlContent) {
+  try {
+    if (!process.env.FROM_EMAIL) {
+      console.warn("⚠️ FROM_EMAIL not set, skipping email.");
+      return;
+    }
+    const result = await resend.emails.send({
+      from: process.env.FROM_EMAIL,
+      to,
+      subject,
+      html: htmlContent,
+    });
+    console.log("📧 Email sent:", result.id);
+    return result;
+  } catch (err) {
+    console.error("❌ Resend email error:", err);
+  }
+}
+
+async function sendTrialEndingEmail(email, plan, endDate) {
+  const subject = "Your HeloxAi Trial is Ending Soon";
+  const html = `
+    <p>Hi there,</p>
+    <p>Your <strong>${plan}</strong> trial ends on <strong>${new Date(endDate * 1000).toLocaleDateString()}</strong>.</p>
+    <p>Your payment method will be charged automatically unless you cancel.</p>
+    <br>
+    <p>Best,<br>The HeloxAi Team</p>
+  `;
+  await sendEmail(email, subject, html);
+}
+
+// ----------------------------
+// MISC HELPERS
+// ----------------------------
+async function getChargeId(paymentIntentId) {
+  try {
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    return paymentIntent.latest_charge;
+  } catch (err) {
+    console.error("❌ Error retrieving charge ID:", err);
+    return null;
+  }
+}
+
+// ----------------------------
+// AUTH MIDDLEWARE
+// ----------------------------
+async function authenticateUser(req, res, next) {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) return res.status(401).json({ error: "Missing token" });
+
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+
+    if (error || !user) {
+      return res.status(401).json({ error: "Invalid user" });
+    }
+
+    // Attach user ID and metadata to request
+    req.user = user;
+    next();
+  } catch (err) {
+    console.error("Auth error:", err);
+    res.status(500).json({ error: "Internal auth error" });
+  }
+}
+
+async function requireAdmin(req, res, next) {
+  try {
+    // Fetch public user role to check admin status
+    const { data: publicUser, error } = await supabase
+      .from("users")
+      .select("role")
+      .eq("id", req.user.id)
+      .single();
+
+    if (error || !publicUser || publicUser.role !== "admin") {
+      return res.status(403).json({ error: "Forbidden: Admins only" });
+    }
+
+    req.adminProfile = publicUser;
+    next();
+  } catch (err) {
+    res.status(500).json({ error: "Error checking permissions" });
+  }
+}
+
+// ----------------------------
+// DB RESET HELPERS
+// ----------------------------
+
+async function handleRefundReset(userId) {
+  const { data: user } = await supabase
+    .from("users")
+    .select("refund_count")
+    .eq("id", userId)
+    .single();
+
+  if (!user) return;
+
+  const newRefundCount = (user.refund_count || 0) + 1;
+
+  const { error } = await supabase
+    .from("users")
+    .update({
+      plan: null,
+      is_premium: false,
+      is_lifetime: false,
+      stripe_subscription_id: null,
+      subscription_status: "refunded",
+      current_period_end: null,
+      refund_count: newRefundCount,
+      last_refund_at: new Date().toISOString(),
+    })
+    .eq("id", userId);
+
+  if (error) {
+    console.error("❌ Failed to reset user after refund:", error.message);
+  } else {
+    console.log(`✅ User ${userId} refunded and reset. Count: ${newRefundCount}`);
+    trackAnalytics("user_refunded", { user_id: userId, refund_count: newRefundCount });
+  }
+}
+
+async function handleSubscriptionCancellation(userId) {
+  const { error } = await supabase
+    .from("users")
+    .update({
+      plan: null,
+      is_premium: false,
+      is_lifetime: false,
+      stripe_subscription_id: null,
+      subscription_status: "canceled",
+      current_period_end: null,
+    })
+    .eq("id", userId);
+
+  if (error) {
+    console.error("❌ Failed to reset user after cancellation:", error.message);
+  } else {
+    console.log(`✅ User ${userId} subscription cancelled.`);
+    trackAnalytics("user_cancelled", { user_id: userId });
+  }
+}
+
+// ----------------------------
+// ROUTES: STRIPE & PAYMENTS
+// ----------------------------
+
+app.post("/create-checkout-session", async (req, res) => {
+  try {
+    const { user_id, email, plan } = req.body;
+
+    if (!user_id || !email || !plan) {
+      return res.status(400).json({ error: "Missing user_id, email, or plan" });
+    }
+
+    let line_item;
+    let mode;
+    let product_name;
+    const logoUrl = "https://heloxai.xyz/logo.png";
+
+    switch (plan) {
+      case "lifetime":
+        mode = "payment";
+        product_name = "HeloxAI Lifetime Access";
+        line_item = {
+          price_data: {
+            currency: "gbp",
+            product_data: {
+              name: product_name,
+              description: "One-time lifetime premium subscription to HeloxAI",
+              images: [logoUrl], 
+            },
+            unit_amount: 49900, 
+          },
+          quantity: 1,
+        };
+        break;
+      case "monthly":
+        mode = "subscription";
+        product_name = "HeloxAI Monthly Premium";
+        if (!process.env.STRIPE_MONTHLY_PRICE_ID) throw new Error("Missing Price ID config");
+        line_item = { price: process.env.STRIPE_MONTHLY_PRICE_ID, quantity: 1 };
+        break;
+      case "yearly":
+        mode = "subscription";
+        product_name = "HeloxAI Yearly Premium";
+        if (!process.env.STRIPE_YEARLY_PRICE_ID) throw new Error("Missing Price ID config");
+        line_item = { price: process.env.STRIPE_YEARLY_PRICE_ID, quantity: 1 };
+        break;
+      default:
+        return res.status(400).json({ error: "Invalid plan type" });
+    }
+
+    const sessionConfig = {
+      mode,
+      line_items: [line_item],
+      success_url: `${process.env.FRONTEND_URL}/prem.html?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/prem.html`,
+      client_reference_id: user_id,
+      customer_email: email,
+      metadata: { user_id, product: plan },
+    };
+
+    if (mode === 'subscription') {
+      sessionConfig.subscription_data = {};
+      if (plan === 'monthly') {
+        sessionConfig.subscription_data.trial_period_days = 3;
+      } else if (plan === 'yearly') {
+        sessionConfig.subscription_data.trial_period_days = 7;
+      }
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionConfig);
+    trackAnalytics("checkout_session_created", { user_id, plan, mode });
+    res.json({ url: session.url });
+
+  } catch (err) {
+    console.error("❌ Create checkout error:", err);
+    res.status(500).json({ error: err.message, type: err.type, code: err.code });
+  }
+});
+
+app.post("/create-portal-session", async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("stripe_customer_id, email")
+      .eq("id", user_id)
+      .single();
+
+    if (error || !user || !user.stripe_customer_id) {
+      return res.status(404).json({ error: "No active subscription found to manage." });
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: user.stripe_customer_id,
+      return_url: `${process.env.FRONTEND_URL}/prem.html`,
+    });
+
+    trackAnalytics("portal_accessed", { user_id });
+    res.json({ url: session.url });
+
+  } catch (err) {
+    console.error("❌ Portal session error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/refund", async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+
+    const { data: user, error: userError } = await supabase
+      .from("users")
+      .select("refund_count, last_refund_at, plan")
+      .eq("id", user_id)
+      .single();
+
+    if (userError || !user) return res.status(404).json({ error: "User not found" });
+
+    if (user.refund_count >= 1) {
+      return res.status(403).json({
+        error: "You have already used your one-time refund option. You can cancel your subscription, but cannot receive another refund."
+      });
+    }
+
+    const { data: payment, error: paymentError } = await supabase
+      .from("payments")
+      .select("*")
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .single();
+
+    if (paymentError || !payment) return res.status(404).json({ error: "Payment not found" });
+    if (payment.status === "refunded") return res.status(400).json({ error: "Payment already refunded" });
+
+    const created = new Date(payment.created_at);
+    const now = new Date();
+    const diffDays = (now - created) / (1000 * 60 * 60 * 24);
+
+    if (diffDays > 7) {
+      return res.status(403).json({ error: "Refund period expired (7 days max)." });
+    }
+
+    if (!payment.stripe_payment_intent_id) {
+      return res.status(400).json({ error: "No payment intent found associated with this payment." });
+    }
+
+    await stripe.refunds.create({
+      payment_intent: payment.stripe_payment_intent_id,
+      reason: "requested_by_customer"
+    });
+
+    await supabase.from("payments")
+      .update({
+        status: "refunded",
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", payment.id);
+
+    await handleRefundReset(user_id);
+
+    res.json({ success: true, message: "Refund processed successfully." });
+
+  } catch (err) {
+    console.error("❌ Refund error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------
+// CORE LOGIC: UPGRADE USER
+// ----------------------------
+async function upgradeUser(session) {
+  const userId = session.client_reference_id;
+  const email = session.customer_details?.email;
+
+  if (!userId && !email) throw new Error("No user identifier found in session");
+
+  let userQuery = supabase
+    .from("users")
+    .select("id, is_lifetime, plan, stripe_subscription_id, refund_count");
+
+  if (userId) userQuery = userQuery.eq("id", userId);
+  else userQuery = userQuery.eq("email", email);
+
+  const { data: user, error: fetchError } = await userQuery.single();
+  if (fetchError || !user) throw new Error("User not found in database");
+
+  const planType = session.metadata.product || "lifetime";
+
+  // Prevent double processing for lifetime
+  if (planType === "lifetime" && user.is_lifetime) {
+    return { already_upgraded: true, user_id: user.id };
+  }
+
+  const updateData = {
+    stripe_customer_id: session.customer || null,
+    is_premium: true,
+    is_free: false,
+    updated_at: new Date().toISOString(),
+  };
+
+  let userProfilePlan = "premium";
+  let productName = "Premium Subscription";
+
+  // PLAN HANDLING
+  if (planType === "lifetime") {
+    updateData.plan = "lifetime";
+    updateData.is_lifetime = true;
+    userProfilePlan = "lifetime";
+    productName = "Lifetime Plan";
+    updateData.stripe_subscription_id = null;
+    updateData.subscription_status = null;
+    updateData.current_period_end = null;
+  } else if (planType === "monthly" || planType === "yearly") {
+    updateData.plan = planType;
+    updateData.is_lifetime = false;
+    productName = planType === "monthly" ? "Monthly Premium" : "Yearly Premium";
+
+    if (session.subscription) {
+      try {
+        const subscription = await stripe.subscriptions.retrieve(session.subscription);
+        updateData.stripe_subscription_id = session.subscription;
+        updateData.subscription_status = "active";
+        updateData.current_period_end = new Date(
+          subscription.current_period_end * 1000
+        ).toISOString();
+      } catch (e) {
+        console.error("Failed to retrieve subscription details for upgrade:", e);
+      }
+    }
+  }
+
+  // UPDATE USER TABLE
+  const { error: updateError } = await supabase
+    .from("users")
+    .update(updateData)
+    .eq("id", user.id);
+
+  if (updateError) {
+    throw new Error("Failed to update users table: " + updateError.message);
+  }
+
+  // UPDATE PROFILE TABLE
+  await supabase
+    .from("user_profiles")
+    .update({ plan: userProfilePlan })
+    .eq("user_id", user.id)
+    .then(({ error }) => {
+      if (error) console.warn("⚠️ user_profiles update failed:", error.message);
+    });
+
+  // RECORD PAYMENT
+  const paymentIntentId = session.payment_intent;
+  let chargeId = null;
+
+  if (paymentIntentId) {
+    chargeId = await getChargeId(paymentIntentId);
+  }
+
+  await supabase
+    .from("payments")
+    .insert({
+      user_id: user.id,
+      stripe_payment_intent_id: paymentIntentId || null,
+      stripe_charge_id: chargeId,
+      amount: session.amount_total,
+      currency: session.currency,
+      email: email,
+      product_name: productName,
+      status: "completed",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .then(({ error }) => {
+      if (error) console.error("⚠️ Payment record insert failed:", error.message);
+    });
+
+  console.log(`✅ ${planType} unlocked for:`, user.id);
+
+  trackAnalytics("user_upgraded", {
+    user_id: user.id,
+    plan: planType,
+    amount: session.amount_total
+  });
+
+  // Log as admin action if it was a manual confirmation, otherwise automated
+  // We'll just track analytics here, but explicit admin actions would use logAdminAction
+
+  return {
+    upgraded: true,
+    user_id: user.id,
+    plan: planType
+  };
+}
+
+app.get("/verify-session", async (req, res) => {
+  try {
+    const { session_id } = req.query;
+    if (!session_id) return res.status(400).json({ error: "Missing session_id" });
+
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    if (session.payment_status !== "paid" && session.payment_status !== "no_payment_required") {
+      return res.json({ pending: true });
+    }
+
+    const result = await upgradeUser(session);
+    res.json(result);
+
+  } catch (err) {
+    console.error("❌ Verify session error:", err);
+    res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
+app.post("/confirm-upgrade", async (req, res) => {
+  try {
+    const { session_id } = req.body;
+    if (!session_id) return res.status(400).json({ error: "Missing session_id" });
+
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+
+    if (!session || (session.payment_status !== "paid" && !session.subscription)) {
+      return res.status(400).json({ error: "Payment not completed" });
+    }
+
+    const result = await upgradeUser(session);
+    res.json(result);
+
+  } catch (err) {
+    console.error("❌ Confirm upgrade error:", err);
+    res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
+// ----------------------------
+// ROUTES: USER & PROFILE
+// ----------------------------
+
+app.get("/user/profile", authenticateUser, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", req.user.id)
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error fetching profile:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/user/profile", authenticateUser, async (req, res) => {
+  try {
+    const { nickname, personality, avatar_url } = req.body;
+    
+    const { data, error } = await supabase
+      .from("profiles")
+      .update({
+        nickname,
+        personality,
+        avatar_url,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error updating profile:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/user/settings", authenticateUser, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("user_settings")
+      .select("*")
+      .eq("id", req.user.id)
+      .single();
+
+    // If no settings exist, return defaults (optional, or just 404)
+    if (error && error.code === 'PGRST116') {
+       return res.json({ theme: 'dark', notifications_enabled: true });
+    }
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error fetching settings:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/user/settings", authenticateUser, async (req, res) => {
+  try {
+    const { theme, notifications_enabled } = req.body;
+    
+    const { data, error } = await supabase
+      .from("user_settings")
+      .upsert({
+        id: req.user.id,
+        theme,
+        notifications_enabled,
+        updated_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error updating settings:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/delete-account", authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Log action before deletion
+    await logAdminAction(userId, "delete_account_self", userId);
+
+    // Delete related data first
+    await supabase.from("payments").delete().eq("user_id", userId);
+    await supabase.from("user_profiles").delete().eq("user_id", userId);
+    await supabase.from("conversations").delete().eq("user_id", userId); // Cascade handles messages/media usually, but explicit is fine
+    await supabase.from("profiles").delete().eq("id", userId);
+    await supabase.from("users").delete().eq("id", userId);
+
+    // Finally delete auth user
+    await supabase.auth.admin.deleteUser(userId);
+
+    console.log(`🗑️ User ${userId} fully deleted`);
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("❌ Delete account error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------
+// ROUTES: CONVERSATIONS & CHAT
+// ----------------------------
+
+// Get all conversations for the logged-in user
+app.get("/conversations", authenticateUser, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("conversations")
+      .select("*")
+      .eq("user_id", req.user.id)
+      .order("updated_at", { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create a new conversation
+app.post("/conversations", authenticateUser, async (req, res) => {
+  try {
+    const { title } = req.body;
+    const { data, error } = await supabase
+      .from("conversations")
+      .insert({
+        user_id: req.user.id,
+        title: title || "New Chat",
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get messages for a specific conversation
+app.get("/conversations/:id/messages", authenticateUser, async (req, res) => {
+  try {
+    // Verify ownership
+    const { data: conv } = await supabase
+      .from("conversations")
+      .select("id")
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .single();
+    
+    if (!conv) return res.status(404).json({ error: "Conversation not found" });
+
+    const { data, error } = await supabase
+      .from("messages")
+      .select("*")
+      .eq("conversation_id", req.params.id)
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add a message to a conversation
+app.post("/conversations/:id/messages", authenticateUser, async (req, res) => {
+  try {
+    const { role, content, content_type, media_url, metadata } = req.body;
+
+    // Verify ownership
+    const { data: conv } = await supabase
+      .from("conversations")
+      .select("id")
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .single();
+
+    if (!conv) return res.status(404).json({ error: "Conversation not found" });
+
+    const { data, error } = await supabase
+      .from("messages")
+      .insert({
+        conversation_id: req.params.id,
+        role,
+        content,
+        content_type: content_type || "text",
+        media_url,
+        metadata: metadata || {},
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    
+    // Update conversation timestamp
+    await supabase
+      .from("conversations")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", req.params.id);
+
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Save generated media
+app.post("/generated-media", authenticateUser, async (req, res) => {
+  try {
+    const { conversation_id, url, media_type, prompt } = req.body;
+    
+    const { data, error } = await supabase
+      .from("generated_media")
+      .insert({
+        user_id: req.user.id,
+        conversation_id,
+        url,
+        media_type: media_type || "image",
+        prompt,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------
+// ROUTES: ADMIN
+// ----------------------------
+
+app.get("/admin/audit-logs", authenticateUser, requireAdmin, async (req, res) => {
+  try {
+    const { limit = 50, offset = 0 } = req.query;
+    const { data, error } = await supabase
+      .from("admin_audit_logs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Admin logs error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------
+// WEBHOOKS
+// ----------------------------
+app.post("/stripe-webhook", async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  if (!sig) return res.status(400).send("Missing signature");
+
+  try {
+    const event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      try {
+        const result = await upgradeUser(session);
+        if (result.already_upgraded) {
+          console.log("ℹ️ Webhook: already upgraded:", result.user_id);
+        }
+      } catch (err) {
+        console.error("❌ Webhook upgrade failed:", err.message);
+      }
+    }
+
+    if (event.type === "charge.refunded") {
+      const charge = event.data.object;
+      const paymentIntentId = charge.payment_intent;
+
+      const { data: payment } = await supabase
+        .from("payments")
+        .select("user_id")
+        .eq("stripe_payment_intent_id", paymentIntentId)
+        .single();
+
+      if (payment && payment.user_id) {
+        const { data: user } = await supabase
+          .from("users")
+          .select("refund_count")
+          .eq("id", payment.user_id)
+          .single();
+
+        if (user && user.refund_count < 1) {
+          await handleRefundReset(payment.user_id);
+        } else {
+          console.log(`ℹ️ Webhook: Refund occurred for user ${payment.user_id}, but refund count is ${user?.refund_count}. Status not reset.`);
+        }
+      }
+    }
+
+    if (event.type === "customer.subscription.deleted") {
+      const subscription = event.data.object;
+      const customerId = subscription.customer;
+
+      const { data: user } = await supabase
+        .from("users")
+        .select("id")
+        .eq("stripe_customer_id", customerId)
+        .single();
+
+      if (user) {
+        await handleSubscriptionCancellation(user.id);
+      }
+    }
+
+    if (event.type === "customer.subscription.trial_will_end") {
+      const subscription = event.data.object;
+      const customerId = subscription.customer;
+      const customer = await stripe.customers.retrieve(customerId);
+      const email = customer.email;
+
+      let planName = "Subscription";
+      if (subscription.items.data[0].price.id === process.env.STRIPE_MONTHLY_PRICE_ID) planName = "Ultimate Monthly";
+      else if (subscription.items.data[0].price.id === process.env.STRIPE_YEARLY_PRICE_ID) planName = "Ultimate Yearly";
+
+      console.log(`📧 Trial ending for ${email}`);
+      await sendTrialEndingEmail(email, planName, subscription.trial_end);
+      trackAnalytics("trial_ending_scheduled", { email, plan: planName, ends_at: subscription.trial_end });
+    }
+
+    if (event.type === "invoice.payment_succeeded") {
+      const invoice = event.data.object;
+      trackAnalytics("recurring_payment_success", { amount: invoice.amount_paid, currency: invoice.currency });
+    }
+
+    if (event.type === "invoice.payment_failed") {
+      const invoice = event.data.object;
+      trackAnalytics("recurring_payment_failed", { amount: invoice.amount_due, currency: invoice.currency });
+    }
+
+    res.sendStatus(200);
+
+  } catch (err) {
+    console.error("❌ Webhook error:", err.message);
+    res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+});
+
+// ----------------------------
+// HEALTH CHECK
+// ----------------------------
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// ----------------------------
+// START
+// ----------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});
