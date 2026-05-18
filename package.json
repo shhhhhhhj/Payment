@@ -1,0 +1,31 @@
+{
+  "name": "stripe-supabase-lifetime",
+  "version": "1.0.0",
+  "description": "Node.js server to handle Stripe payments and update Supabase user plans",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [
+    "stripe",
+    "supabase",
+    "payments",
+    "webhook",
+    "lifetime-plan"
+  ],
+  "author": "GoldYLocks",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.33.1",
+    "body-parser": "^1.20.2",
+    "express": "^4.18.2",
+    "resend": "^3.2.0",
+     "cors": "^2.8.5",
+    "stripe": "^12.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
