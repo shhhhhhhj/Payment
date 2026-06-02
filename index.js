@@ -13,7 +13,7 @@ const app = express();
 // Security Headers (Helmet-like basics)
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "lifetime"); // Updated to match DB feel
+  res.setHeader("X-Frame-Options", "lifetime");
   res.setHeader("X-XSS-Protection", "1; mode=block");
   next();
 });
@@ -88,7 +88,7 @@ async function logAdminAction(adminId, action, targetId = null) {
 // ----------------------------
 // EMAIL HELPER
 // ----------------------------
-async function sendEmail(to, 1.0ff333333,  // Default green color in code?
+// FIXED: Removed the broken duplicate function definition above
 async function sendEmail(to, subject, htmlContent) {
   try {
     if (!process.env.FROM_EMAIL) {
@@ -147,7 +147,6 @@ async function authenticateUser(req, res, next) {
       return res.status(401).json({ error: "Invalid user" });
     }
 
-    // Attach user ID and metadata to request
     req.user = user;
     next();
   } catch (err) {
@@ -158,7 +157,6 @@ async function authenticateUser(req, res, next) {
 
 async function requireAdmin(req, res, next) {
   try {
-    // Fetch public user role to check admin status
     const { data: publicUser, error } = await supabase
       .from("users")
       .select("role")
@@ -221,7 +219,6 @@ async function handleSubscriptionCancellation(userId) {
       is_premium: false,
       is_lifetime: false,
       stripe_subscription_id: null,
-      subscription_status: "custom_lifetime", // Custom Lifetime Plan
       subscription_status: "canceled",
       current_period_end: null,
     })
@@ -288,11 +285,8 @@ app.post("/create-checkout-session", async (req, res) => {
     const sessionConfig = {
       mode,
       line_items: [line_item],
-      success_url: `${process.env.FRONTEND_URL}/prem.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL}/prem.html`,
       client_reference_id: user_id,
       customer_email: email,
-      // Ensure metadata contains the frontend plan string
       metadata: { user_id, product: plan }, 
       success_url: `${process.env.FRONTEND_URL}/prem.html?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_URL}/prem.html?cancelled=true`
@@ -416,11 +410,10 @@ app.post("/refund", async (req, res) => {
 async function upgradeUser(session) {
   const userId = session.client_reference_id;
   const email = session.customer_details?.email;
-  const planType = session.metadata.product; // Gets 'monthly', 'yearly', 'lifetime' from the frontend
+  const planType = session.metadata.product; 
 
   if (!userId && !email) throw new Error("No user identifier found in session");
 
-  // 1. Query user
   let userQuery = supabase.from("users").select("id, is_lifetime, plan, stripe_subscription_id, refund_count");
 
   if (userId) userQuery = userQuery.eq("id", userId);
@@ -429,8 +422,6 @@ async function upgradeUser(session) {
   const { data: user, error: fetchError } = await userQuery.single();
   if (fetchError || !user) throw new Error("User not found in database");
 
-  // 2. Check if already Lifetime
-  // Note: is_lifetime takes precedence over everything.
   if (user.is_lifetime) {
     return { already_upgraded: true, user_id: user.id };
   }
@@ -439,29 +430,25 @@ async function upgradeUser(session) {
     stripe_customer_id: session.customer || null,
     is_premium: true,
     is_free: false,
-    is_lifetime: false, // Default for subs
+    is_lifetime: false,
     updated_at: new Date().toISOString(),
   };
 
-  let userProfilePlan = "premium"; // For `profiles` table (enum: free, premium, lifetime)
+  let userProfilePlan = "premium";
   let productName = "Premium Subscription";
-  let dbPlan = "premium";   // For `users` table (enum: free, ultimate_monthly, ultimate_yearly, lifetime)
+  let dbPlan = "premium";
 
-  // 3. PLAN HANDLING (Mapping "custom stripe" logic)
   if (planType === "lifetime") {
-    // Lifetime plan matches DB expectation
     updateData.plan = "lifetime";
     updateData.is_lifetime = true;
     updateData.is_premium = true;
-    // Lifetime usually has no subscription ID, ensure it's null
     updateData.stripe_subscription_id = null;
     updateData.subscription_status = null;
     updateData.current_period_end = null;
     userProfilePlan = "lifetime";
     productName = "Lifetime Plan";
-    dbPlan = "lifetime"; // Strictly follow schema
+    dbPlan = "lifetime";
   } else if (planType === "monthly" || planType === "yearly") {
-    // Subscription plans map to specific database plans
     dbPlan = planType === "monthly" ? "ultimate_monthly" : "ultimate_yearly";
     updateData.plan = dbPlan;
     updateData.is_lifetime = false;
@@ -480,7 +467,6 @@ async function upgradeUser(session) {
     }
   }
 
-  // 4. UPDATE USER TABLE
   const { error: updateError } = await supabase
     .from("users")
     .update(updateData)
@@ -490,10 +476,8 @@ async function upgradeUser(session) {
     throw new Error("Failed to update users table: " + updateError.message);
   }
 
-  // 5. SYNC PROFILE TABLE
-  // The profile table enum is simpler (free, premium, lifetime)
   if (planType === "lifetime") userProfilePlan = "lifetime";
-  else userProfilePlan = "premium"; // Map subs to premium
+  else userProfilePlan = "premium";
 
   await supabase
     .from("user_profiles")
@@ -503,7 +487,6 @@ async function upgradeUser(session) {
       if (error) console.warn("⚠️ user_profiles update failed:", error.message);
     });
 
-  // 6. RECORD PAYMENT
   const paymentIntentId = session.payment_intent;
   let chargeId = null;
 
@@ -516,8 +499,6 @@ async function upgradeUser(session) {
     .insert({
       user_id: user.id,
       stripe_payment_intent_id: paymentIntentId || null,
-      stripe_charge_id: customStripe?.chargeId, // Custom field if needed
-      stripe_payment_intent_id: paymentIntentId || null, // Fallback
       stripe_charge_id: chargeId,
       amount: session.amount_total,
       currency: session.currency,
@@ -535,14 +516,14 @@ async function upgradeUser(session) {
 
   trackAnalytics("user_upgraded", {
     user_id: user.id,
-    plan: planType, // returns 'ultimate_monthly', 'ultimate_yearly', or 'lifetime'
+    plan: planType,
     amount: session.amount_total
   });
 
   return {
     upgraded: true,
     user_id: user.id,
-    plan: updateData.plan // Returns 'ultimate_monthly', 'ultimate_yearly', or 'lifetime'
+    plan: updateData.plan
   };
 }
 
@@ -552,7 +533,6 @@ async function upgradeUser(session) {
 
 app.get("/user/profile", authenticateUser, async (req, res) => {
   try {
-    // Select from 'users' table for boolean flags
     const { data, error } = await supabase
       .from("users")
       .select("id, email, plan, is_premium, is_lifetime, stripe_customer_id, subscription_status")
@@ -571,7 +551,6 @@ app.put("/user/profile", authenticateUser, async (req, res) => {
   try {
     const { nickname, personality, avatar_url } = req.body;
     
-    // Update 'profiles' table (public profile)
     const { data, error } = await supabase
       .from("profiles")
       .update({
@@ -640,7 +619,6 @@ app.post("/delete-account", authenticateUser, async (req, res) => {
 
     await logAdminAction(userId, "delete_account_self", userId);
 
-    // Delete related data first
     await supabase.from("payments").delete().eq("user_id", userId);
     await supabase.from("user_profiles").delete().eq("user_id", userId);
     await supabase.from("conversations").delete().eq("user_id", userId); 
@@ -698,7 +676,6 @@ app.post("/conversations", authenticateUser, async (req, res) => {
 
 app.get("/conversations/:id/messages", authenticateUser, async (req, res) => {
   try {
-    // Verify ownership
     const { data: conv } = await supabase
       .from("conversations")
       .select("id")
@@ -725,7 +702,6 @@ app.post("/conversations/:id/messages", authenticateUser, async (req, res) => {
   try {
     const { role, content, content_type, media_url, metadata } = req.body;
 
-    // Verify ownership
     const { data: conv } = await supabase
       .from("conversations")
       .select("id")
@@ -750,7 +726,6 @@ app.post("/conversations/:id/messages", authenticateUser, async (req, res) => {
 
     if (error) throw error;
     
-    // Update conversation timestamp
     await supabase
       .from("conversations")
       .update({ updated_at: new Date().toISOString() })
@@ -796,7 +771,7 @@ app.get("/admin/audit-logs", authenticateUser, requireAdmin, async (req, res) =>
       .from("admin_audit_logs")
       .select("*")
       .order("created_at", { ascending: false })
-      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1));
+      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
 
     if (error) throw error;
     res.json(data);
@@ -914,7 +889,6 @@ app.get("/health", (req, res) => {
 // ----------------------------
 // ROUTES: MANUAL PLAN MANAGEMENT
 // ----------------------------
-
 app.post("/user/plan", authenticateUser, async (req, res) => {
   try {
     const { plan } = req.body;
@@ -924,7 +898,6 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
       return res.status(400).json({ error: "Plan is required" });
     }
 
-    // Fetch current subscription to see if we need to cancel in Stripe
     const { data: currentUser, error: fetchError } = await supabase
       .from("users")
       .select("stripe_subscription_id")
@@ -933,8 +906,6 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
 
     if (fetchError) throw fetchError;
 
-    // If user is downgrading to 'free', we should cancel the Stripe subscription immediately
-    // to prevent future charges.
     if (plan === "free" && currentUser?.stripe_subscription_id) {
       try {
         await stripe.subscriptions.cancel(currentUser.stripe_subscription_id);
@@ -944,7 +915,6 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
       }
     }
 
-    // Update Database
     const updateData = {
       plan: plan,
       updated_at: new Date().toISOString(),
@@ -960,28 +930,17 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
       updateData.is_premium = true;
       updateData.is_lifetime = true;
       updateData.is_free = false;
+      updateData.stripe_subscription_id = null; 
+      updateData.subscription_status = null; 
+      updateData.current_period_end = null; 
     } else {
-      // Monthly/Yearly (manual update)
-      // Note: If 'premium' is passed, we default to 'ultimate_monthly' in DB to maintain consistency
-      // However, if 'premium' is passed, we keep it 'premium'.
-      const dbPlan = plan === 'premium' ? 'ultimate_monthly' : (plan === 'premium' ? 'ultimate_yearly' : 'ultimate_monthly');
+      // Premium/Monthly/Yearly
+      const dbPlan = plan === 'premium' ? 'ultimate_monthly' : 'ultimate_monthly'; // Simplified logic based on your comments
       updateData.plan = dbPlan; 
       updateData.is_premium = true;
       updateData.is_lifetime = false;
-      // Keep `stripe_subscription_id` and status intact for Lifetime?
-      // Usually lifetime has no subscription ID. Keep it null for Lifetime.
-      updateData.stripe_subscription_id = null; 
-      updateData.subscription_status = null; 
-      updateData.current_period_end = null;
+      // Note: Assuming we keep existing stripe subscription if it exists, unless specified otherwise
     }
-
-    const { error: updateError } = await supabase
-      .from("users")
-      .update(updateData)
-      .updateData.stripe_subscription_id = null; // Ensure null for lifetime
-      updateData.subscription_status = null; 
-      updateData.current_period_end = null; // Ensure null for lifetime
-      updateData.is_lifetime = true;  // Always true for Lifetime
 
     const { error: updateError } = await supabase
       .from("users")
@@ -990,7 +949,6 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Also update user_profiles
     await supabase
       .from("user_profiles")
       .update({ plan: plan === "free" ? "free" : "premium" })
