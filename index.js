@@ -41,11 +41,10 @@ app.use(cors({
 // ----------------------------
 // BODY PARSER STRATEGY
 // ----------------------------
-app.post("/stripe-webhook", bodyParser.raw({ type: "application/json" }));
-
+// We need raw body for Stripe Webhooks, but JSON for everything else
 app.use((req, res, next) => {
   if (req.path === '/stripe-webhook') {
-    return next();
+    return bodyParser.raw({ type: "application/json" })(req, res, next);
   }
   express.json()(req, res, next);
 });
@@ -254,7 +253,7 @@ app.post("/create-checkout-session", async (req, res) => {
 
     switch (plan) {
       case "lifetime":
-        mode = "payment";
+        mode = "payment"; // One-time payment
         product_name = "HeloxAI Lifetime Access";
         line_item = {
           price_data: {
@@ -449,6 +448,7 @@ async function upgradeUser(session) {
     updateData.is_lifetime = true;
     userProfilePlan = "lifetime";
     productName = "Lifetime Plan";
+    // Lifetime is a one-time payment, not a subscription
     updateData.stripe_subscription_id = null;
     updateData.subscription_status = null;
     updateData.current_period_end = null;
@@ -481,7 +481,7 @@ async function upgradeUser(session) {
     throw new Error("Failed to update users table: " + updateError.message);
   }
 
-  // UPDATE PROFILE TABLE
+  // UPDATE PROFILE TABLE (Syncs plan string for public profiles if needed)
   await supabase
     .from("user_profiles")
     .update({ plan: userProfilePlan })
@@ -523,9 +523,6 @@ async function upgradeUser(session) {
     plan: planType,
     amount: session.amount_total
   });
-
-  // Log as admin action if it was a manual confirmation, otherwise automated
-  // We'll just track analytics here, but explicit admin actions would use logAdminAction
 
   return {
     upgraded: true,
@@ -581,9 +578,11 @@ app.post("/confirm-upgrade", async (req, res) => {
 
 app.get("/user/profile", authenticateUser, async (req, res) => {
   try {
+    // FIX: Select from 'users' table instead of 'profiles'
+    // The frontend relies on 'is_premium' and 'is_lifetime' which live in 'users'
     const { data, error } = await supabase
-      .from("profiles")
-      .select("*")
+      .from("users")
+      .select("id, email, plan, is_premium, is_lifetime, stripe_customer_id, subscription_status")
       .eq("id", req.user.id)
       .single();
 
@@ -599,6 +598,7 @@ app.put("/user/profile", authenticateUser, async (req, res) => {
   try {
     const { nickname, personality, avatar_url } = req.body;
     
+    // Update public profile (profiles table)
     const { data, error } = await supabase
       .from("profiles")
       .update({
@@ -627,7 +627,6 @@ app.get("/user/settings", authenticateUser, async (req, res) => {
       .eq("id", req.user.id)
       .single();
 
-    // If no settings exist, return defaults (optional, or just 404)
     if (error && error.code === 'PGRST116') {
        return res.json({ theme: 'dark', notifications_enabled: true });
     }
@@ -666,17 +665,15 @@ app.post("/delete-account", authenticateUser, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Log action before deletion
     await logAdminAction(userId, "delete_account_self", userId);
 
     // Delete related data first
     await supabase.from("payments").delete().eq("user_id", userId);
     await supabase.from("user_profiles").delete().eq("user_id", userId);
-    await supabase.from("conversations").delete().eq("user_id", userId); // Cascade handles messages/media usually, but explicit is fine
+    await supabase.from("conversations").delete().eq("user_id", userId); 
     await supabase.from("profiles").delete().eq("id", userId);
     await supabase.from("users").delete().eq("id", userId);
 
-    // Finally delete auth user
     await supabase.auth.admin.deleteUser(userId);
 
     console.log(`🗑️ User ${userId} fully deleted`);
@@ -692,7 +689,6 @@ app.post("/delete-account", authenticateUser, async (req, res) => {
 // ROUTES: CONVERSATIONS & CHAT
 // ----------------------------
 
-// Get all conversations for the logged-in user
 app.get("/conversations", authenticateUser, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -708,7 +704,6 @@ app.get("/conversations", authenticateUser, async (req, res) => {
   }
 });
 
-// Create a new conversation
 app.post("/conversations", authenticateUser, async (req, res) => {
   try {
     const { title } = req.body;
@@ -728,7 +723,6 @@ app.post("/conversations", authenticateUser, async (req, res) => {
   }
 });
 
-// Get messages for a specific conversation
 app.get("/conversations/:id/messages", authenticateUser, async (req, res) => {
   try {
     // Verify ownership
@@ -754,12 +748,10 @@ app.get("/conversations/:id/messages", authenticateUser, async (req, res) => {
   }
 });
 
-// Add a message to a conversation
 app.post("/conversations/:id/messages", authenticateUser, async (req, res) => {
   try {
     const { role, content, content_type, media_url, metadata } = req.body;
 
-    // Verify ownership
     const { data: conv } = await supabase
       .from("conversations")
       .select("id")
@@ -784,7 +776,6 @@ app.post("/conversations/:id/messages", authenticateUser, async (req, res) => {
 
     if (error) throw error;
     
-    // Update conversation timestamp
     await supabase
       .from("conversations")
       .update({ updated_at: new Date().toISOString() })
@@ -796,7 +787,6 @@ app.post("/conversations/:id/messages", authenticateUser, async (req, res) => {
   }
 });
 
-// Save generated media
 app.post("/generated-media", authenticateUser, async (req, res) => {
   try {
     const { conversation_id, url, media_type, prompt } = req.body;
@@ -947,8 +937,6 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-// ... existing code ...
-
 // ----------------------------
 // ROUTES: MANUAL PLAN MANAGEMENT
 // ----------------------------
@@ -972,8 +960,7 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
     if (fetchError) throw fetchError;
 
     // If user is downgrading to 'free', we should cancel the Stripe subscription immediately
-    // to prevent future charges, or just mark them as cancelled locally.
-    // For safety, we cancel in Stripe if a subscription ID exists.
+    // to prevent future charges.
     if (plan === "free" && currentUser?.stripe_subscription_id) {
       try {
         await stripe.subscriptions.cancel(currentUser.stripe_subscription_id);
