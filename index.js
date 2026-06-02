@@ -967,6 +967,66 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
 });
 
 // ----------------------------
+// ROUTES: SESSION VERIFICATION
+// ----------------------------
+app.get("/verify-session", async (req, res) => {
+  const { session_id } = req.query;
+
+  if (!session_id) {
+    return res.status(400).json({ error: "Missing session_id" });
+  }
+
+  try {
+    // 1. Retrieve the session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+
+    // 2. Check if payment was successful
+    if (session.payment_status !== 'paid') {
+      return res.status(400).json({ error: "Payment not completed" });
+    }
+
+    // 3. Get user details from our DB (assuming upgradeUser webhook ran)
+    const userId = session.client_reference_id;
+    
+    if (!userId) {
+      return res.status(400).json({ error: "No user associated with session" });
+    }
+
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("plan, is_lifetime, is_premium")
+      .eq("id", userId)
+      .single();
+
+    if (error || !user) {
+      // Fallback: If webhook hasn't fired yet, trigger upgrade manually here
+      // This ensures the user gets access immediately even if webhook is delayed
+      try {
+        await upgradeUser(session);
+        return res.json({ 
+          status: "success", 
+          plan: session.metadata.product || "lifetime" 
+        });
+      } catch (upgradeErr) {
+        console.error("Manual upgrade failed:", upgradeErr);
+        return res.status(500).json({ error: "Failed to verify upgrade" });
+      }
+    }
+
+    // Return the current status
+    return res.json({ 
+      status: "success", 
+      plan: user.plan,
+      is_lifetime: user.is_lifetime 
+    });
+
+  } catch (err) {
+    console.error("❌ Verify session error:", err);
+    res.status(500).json({ error: "Failed to verify session" });
+  }
+});
+
+// ----------------------------
 // START
 // ----------------------------
 const PORT = process.env.PORT || 3000;
