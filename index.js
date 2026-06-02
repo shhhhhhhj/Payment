@@ -947,6 +947,89 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
+// ... existing code ...
+
+// ----------------------------
+// ROUTES: MANUAL PLAN MANAGEMENT
+// ----------------------------
+
+app.post("/user/plan", authenticateUser, async (req, res) => {
+  try {
+    const { plan } = req.body;
+    const userId = req.user.id;
+
+    if (!plan) {
+      return res.status(400).json({ error: "Plan is required" });
+    }
+
+    // Fetch current subscription to see if we need to cancel in Stripe
+    const { data: currentUser, error: fetchError } = await supabase
+      .from("users")
+      .select("stripe_subscription_id")
+      .eq("id", userId)
+      .single();
+
+    if (fetchError) throw fetchError;
+
+    // If user is downgrading to 'free', we should cancel the Stripe subscription immediately
+    // to prevent future charges, or just mark them as cancelled locally.
+    // For safety, we cancel in Stripe if a subscription ID exists.
+    if (plan === "free" && currentUser?.stripe_subscription_id) {
+      try {
+        await stripe.subscriptions.cancel(currentUser.stripe_subscription_id);
+        console.log(`🚫 Stripe subscription ${currentUser.stripe_subscription_id} cancelled for user ${userId}`);
+      } catch (stripeError) {
+        console.error("⚠️ Failed to cancel Stripe sub, updating DB anyway:", stripeError.message);
+      }
+    }
+
+    // Update Database
+    const updateData = {
+      plan: plan,
+      updated_at: new Date().toISOString(),
+    };
+
+    if (plan === "free") {
+      updateData.is_premium = false;
+      updateData.is_lifetime = false;
+      updateData.subscription_status = "canceled";
+      updateData.stripe_subscription_id = null;
+      updateData.current_period_end = null;
+    } else if (plan === "lifetime") {
+      updateData.is_premium = true;
+      updateData.is_lifetime = true;
+      updateData.subscription_status = null;
+    } else {
+      // Monthly/Yearly
+      updateData.is_premium = true;
+      updateData.is_lifetime = false;
+    }
+
+    const { error: updateError } = await supabase
+      .from("users")
+      .update(updateData)
+      .eq("id", userId);
+
+    if (updateError) throw updateError;
+
+    // Also update user_profiles if that table exists
+    await supabase
+      .from("user_profiles")
+      .update({ plan: plan === "free" ? "free" : "premium" })
+      .eq("user_id", userId)
+      .then(({ error }) => {
+        if (error) console.warn("⚠️ user_profiles update failed:", error.message);
+      });
+
+    console.log(`✅ User ${userId} plan manually updated to: ${plan}`);
+    res.json({ success: true, plan });
+
+  } catch (err) {
+    console.error("❌ Manual plan update error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ----------------------------
 // START
 // ----------------------------
