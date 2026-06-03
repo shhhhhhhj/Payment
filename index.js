@@ -88,7 +88,6 @@ async function logAdminAction(adminId, action, targetId = null) {
 // ----------------------------
 // EMAIL HELPER
 // ----------------------------
-// FIXED: Removed the broken duplicate function definition above
 async function sendEmail(to, subject, htmlContent) {
   try {
     if (!process.env.FROM_EMAIL) {
@@ -410,7 +409,7 @@ app.post("/refund", async (req, res) => {
 async function upgradeUser(session) {
   const userId = session.client_reference_id;
   const email = session.customer_details?.email;
-  const planType = session.metadata.product; 
+  const planType = session.metadata.product; // 'lifetime', 'monthly', 'yearly'
 
   if (!userId && !email) throw new Error("No user identifier found in session");
 
@@ -434,27 +433,45 @@ async function upgradeUser(session) {
     updated_at: new Date().toISOString(),
   };
 
-  let userProfilePlan = "premium";
+  // Map frontend plan types to DB plan strings
+  let dbPlan = "premium"; // Default
   let productName = "Premium Subscription";
-  let dbPlan = "premium";
 
   if (planType === "lifetime") {
+    dbPlan = "lifetime";
+    productName = "Lifetime Plan";
     updateData.plan = "lifetime";
     updateData.is_lifetime = true;
     updateData.is_premium = true;
     updateData.stripe_subscription_id = null;
     updateData.subscription_status = null;
     updateData.current_period_end = null;
-    userProfilePlan = "lifetime";
-    productName = "Lifetime Plan";
-    dbPlan = "lifetime";
-  } else if (planType === "monthly" || planType === "yearly") {
-    dbPlan = planType === "monthly" ? "ultimate_monthly" : "ultimate_yearly";
-    updateData.plan = dbPlan;
+  } else if (planType === "monthly") {
+    dbPlan = "ultimate_monthly";
+    productName = "Ultimate Monthly";
+    updateData.plan = "ultimate_monthly";
     updateData.is_lifetime = false;
     updateData.is_premium = true;
-    productName = planType === "monthly" ? "Ultimate Monthly" : "Ultimate Yearly";
-
+    
+    // Handle Subscription Details
+    if (session.subscription) {
+      try {
+        const subscription = await stripe.subscriptions.retrieve(session.subscription);
+        updateData.stripe_subscription_id = session.subscription;
+        updateData.subscription_status = "active";
+        updateData.current_period_end = new Date(subscription.current_period_end * 1000).toISOString();
+      } catch (e) {
+        console.error("Failed to retrieve subscription details for upgrade:", e);
+      }
+    }
+  } else if (planType === "yearly") {
+    dbPlan = "ultimate_yearly";
+    productName = "Ultimate Yearly";
+    updateData.plan = "ultimate_yearly";
+    updateData.is_lifetime = false;
+    updateData.is_premium = true;
+    
+    // Handle Subscription Details
     if (session.subscription) {
       try {
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
@@ -476,12 +493,11 @@ async function upgradeUser(session) {
     throw new Error("Failed to update users table: " + updateError.message);
   }
 
-  if (planType === "lifetime") userProfilePlan = "lifetime";
-  else userProfilePlan = "premium";
-
+  // Update user_profiles table (optional, keeping it generic as 'premium' or 'free')
+  const profilePlan = planType === 'free' ? 'free' : 'premium';
   await supabase
     .from("user_profiles")
-    .update({ plan: userProfilePlan })
+    .update({ plan: profilePlan })
     .eq("user_id", user.id)
     .then(({ error }) => {
       if (error) console.warn("⚠️ user_profiles update failed:", error.message);
@@ -516,14 +532,14 @@ async function upgradeUser(session) {
 
   trackAnalytics("user_upgraded", {
     user_id: user.id,
-    plan: planType,
+    plan: dbPlan,
     amount: session.amount_total
   });
 
   return {
     upgraded: true,
     user_id: user.id,
-    plan: updateData.plan
+    plan: dbPlan
   };
 }
 
@@ -551,19 +567,35 @@ app.put("/user/profile", authenticateUser, async (req, res) => {
   try {
     const { nickname, personality, avatar_url } = req.body;
     
-    const { data, error } = await supabase
-      .from("profiles")
-      .update({
-        nickname,
-        personality,
-        avatar_url,
-        updated_at: new Date().toISOString(),
-      })
+    // Ensure we update the correct table. 
+    // Based on previous schema analysis, users table has nickname/personality.
+    // profiles table has avatar_url.
+    
+    // 1. Update users table
+    const updates = {};
+    if (nickname) updates.nickname = nickname;
+    if (personality) updates.personality = personality;
+    
+    // 2. Update profiles table
+    if (avatar_url) {
+        await supabase.from("profiles").update({ avatar_url })
+          .eq("id", req.user.id);
+    }
+
+    if (Object.keys(updates).length > 0) {
+        updates.updated_at = new Date().toISOString();
+        const { error } = await supabase.from("users").update(updates).eq("id", req.user.id);
+        if (error) throw error;
+    }
+    
+    // Fetch and return updated data
+    const { data, error: fetchError } = await supabase
+      .from("users")
+      .select("id, email, plan, is_premium, is_lifetime")
       .eq("id", req.user.id)
-      .select()
       .single();
 
-    if (error) throw error;
+    if (fetchError) throw fetchError;
     res.json(data);
   } catch (err) {
     console.error("Error updating profile:", err);
@@ -868,7 +900,7 @@ app.post("/stripe-webhook", async (req, res) => {
 
     if (event.type === "invoice.payment_failed") {
       const invoice = event.data.object;
-      trackAnalytics("recurring_payment_failed", { amount: invoice.amount_due, currency: invoice.currency });
+      trackAnalytics("rrecurring_payment_failed", { amount: invoice.amount_due, currency: invoice.currency });
     }
 
     res.sendStatus(200);
@@ -927,19 +959,20 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
       updateData.stripe_subscription_id = null;
       updateData.current_period_end = null;
     } else if (plan === "lifetime") {
+      updateData.plan = "lifetime";
       updateData.is_premium = true;
       updateData.is_lifetime = true;
-      updateData.is_free = false;
       updateData.stripe_subscription_id = null; 
       updateData.subscription_status = null; 
       updateData.current_period_end = null; 
-    } else {
-      // Premium/Monthly/Yearly
-      const dbPlan = plan === 'premium' ? 'ultimate_monthly' : 'ultimate_monthly'; // Simplified logic based on your comments
-      updateData.plan = dbPlan; 
+    } else if (plan === "ultimate_monthly") {
+      updateData.plan = "ultimate_monthly";
       updateData.is_premium = true;
       updateData.is_lifetime = false;
-      // Note: Assuming we keep existing stripe subscription if it exists, unless specified otherwise
+    } else if (plan === "ultimate_yearly") {
+      updateData.plan = "ultimate_yearly";
+      updateData.is_premium = true;
+      updateData.is_lifetime = false;
     }
 
     const { error: updateError } = await supabase
@@ -951,7 +984,7 @@ app.post("/user/plan", authenticateUser, async (req, res) => {
 
     await supabase
       .from("user_profiles")
-      .update({ plan: plan === "free" ? "free" : "premium" })
+      .update({ plan: plan === "free" ? "free" : (plan === "lifetime" ? "lifetime" : "premium") })
       .eq("user_id", userId)
       .then(({ error }) => {
         if (error) console.warn("⚠️ user_profiles update failed:", error.message);
@@ -985,7 +1018,7 @@ app.get("/verify-session", async (req, res) => {
       return res.status(400).json({ error: "Payment not completed" });
     }
 
-    // 3. Get user details from our DB (assuming upgradeUser webhook ran)
+    // 3. Get user details from our DB
     const userId = session.client_reference_id;
     
     if (!userId) {
@@ -1000,12 +1033,12 @@ app.get("/verify-session", async (req, res) => {
 
     if (error || !user) {
       // Fallback: If webhook hasn't fired yet, trigger upgrade manually here
-      // This ensures the user gets access immediately even if webhook is delayed
       try {
         await upgradeUser(session);
+        const planMap = { 'monthly': 'ultimate_monthly', 'yearly': 'ultimate_yearly' };
         return res.json({ 
           status: "success", 
-          plan: session.metadata.product || "lifetime" 
+          plan: planMap[session.metadata.product] || user.plan 
         });
       } catch (upgradeErr) {
         console.error("Manual upgrade failed:", upgradeErr);
