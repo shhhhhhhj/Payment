@@ -10,7 +10,7 @@ import bodyParser from "body-parser";
 // ----------------------------
 const app = express();
 
-// Security Headers (Helmet-like basics)
+// Security Headers
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "lifetime");
@@ -38,9 +38,7 @@ app.use(cors({
   credentials: true
 }));
 
-// ----------------------------
-// BODY PARSER STRATEGY
-// ----------------------------
+// Body Parser Strategy
 app.use((req, res, next) => {
   if (req.path === '/stripe-webhook') {
     return bodyParser.raw({ type: "application/json" })(req, res, next);
@@ -48,9 +46,7 @@ app.use((req, res, next) => {
   express.json()(req, res, next);
 });
 
-// ----------------------------
-// SERVICES
-// ----------------------------
+// Services
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
   typescript: true,
@@ -63,16 +59,11 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY 
 );
 
-// ----------------------------
-// ANALYTICS HELPER
-// ----------------------------
+// Helpers
 function trackAnalytics(eventName, properties = {}) {
   console.log(`[ANALYTICS] ${eventName}:`, JSON.stringify(properties));
 }
 
-// ----------------------------
-// AUDIT LOGGING HELPER
-// ----------------------------
 async function logAdminAction(adminId, action, targetId = null) {
   try {
     await supabase.from("admin_audit_logs").insert({
@@ -85,9 +76,6 @@ async function logAdminAction(adminId, action, targetId = null) {
   }
 }
 
-// ----------------------------
-// EMAIL HELPER
-// ----------------------------
 async function sendEmail(to, subject, htmlContent) {
   try {
     if (!process.env.FROM_EMAIL) {
@@ -119,9 +107,6 @@ async function sendTrialEndingEmail(email, plan, endDate) {
   await sendEmail(email, subject, html);
 }
 
-// ----------------------------
-// MISC HELPERS
-// ----------------------------
 async function getChargeId(paymentIntentId) {
   try {
     const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
@@ -132,9 +117,7 @@ async function getChargeId(paymentIntentId) {
   }
 }
 
-// ----------------------------
-// AUTH MIDDLEWARE
-// ----------------------------
+// Auth Middleware
 async function authenticateUser(req, res, next) {
   try {
     const token = req.headers.authorization?.split(" ")[1];
@@ -404,7 +387,7 @@ app.post("/refund", async (req, res) => {
 });
 
 // ----------------------------
-// CORE LOGIC: UPGRADE USER
+// CORE LOGIC: UPGRADE USER (FIXED)
 // ----------------------------
 async function upgradeUser(session) {
   const userId = session.client_reference_id;
@@ -413,19 +396,10 @@ async function upgradeUser(session) {
 
   if (!userId && !email) throw new Error("No user identifier found in session");
 
-  let userQuery = supabase.from("users").select("id, is_lifetime, plan, stripe_subscription_id, refund_count");
-
-  if (userId) userQuery = userQuery.eq("id", userId);
-  else userQuery = userQuery.eq("email", email);
-
-  const { data: user, error: fetchError } = await userQuery.single();
-  if (fetchError || !user) throw new Error("User not found in database");
-
-  if (user.is_lifetime) {
-    return { already_upgraded: true, user_id: user.id };
-  }
-
-  const updateData = {
+  // Base Data for Upsert (Used for both creating new users and updating existing ones)
+  const baseData = {
+    id: userId,
+    email: email,
     stripe_customer_id: session.customer || null,
     is_premium: true,
     is_free: false,
@@ -433,33 +407,39 @@ async function upgradeUser(session) {
     updated_at: new Date().toISOString(),
   };
 
-  // Map frontend plan types to DB plan strings
   let dbPlan = "premium"; // Default
   let productName = "Premium Subscription";
 
+  // Determine Plan Specifics
   if (planType === "lifetime") {
     dbPlan = "lifetime";
     productName = "Lifetime Plan";
-    updateData.plan = "lifetime";
-    updateData.is_lifetime = true;
-    updateData.is_premium = true;
-    updateData.stripe_subscription_id = null;
-    updateData.subscription_status = null;
-    updateData.current_period_end = null;
+    Object.assign(baseData, {
+      plan: "lifetime",
+      is_lifetime: true,
+      is_premium: true,
+      stripe_subscription_id: null,
+      subscription_status: null,
+      current_period_end: null
+    });
   } else if (planType === "monthly") {
     dbPlan = "ultimate_monthly";
     productName = "Ultimate Monthly";
-    updateData.plan = "ultimate_monthly";
-    updateData.is_lifetime = false;
-    updateData.is_premium = true;
+    Object.assign(baseData, {
+      plan: "ultimate_monthly",
+      is_lifetime: false,
+      is_premium: true,
+    });
     
     // Handle Subscription Details
     if (session.subscription) {
       try {
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
-        updateData.stripe_subscription_id = session.subscription;
-        updateData.subscription_status = "active";
-        updateData.current_period_end = new Date(subscription.current_period_end * 1000).toISOString();
+        Object.assign(baseData, {
+          stripe_subscription_id: session.subscription,
+          subscription_status: "active",
+          current_period_end: new Date(subscription.current_period_end * 1000).toISOString()
+        });
       } catch (e) {
         console.error("Failed to retrieve subscription details for upgrade:", e);
       }
@@ -467,38 +447,46 @@ async function upgradeUser(session) {
   } else if (planType === "yearly") {
     dbPlan = "ultimate_yearly";
     productName = "Ultimate Yearly";
-    updateData.plan = "ultimate_yearly";
-    updateData.is_lifetime = false;
-    updateData.is_premium = true;
-    
+    Object.assign(baseData, {
+      plan: "ultimate_yearly",
+      is_lifetime: false,
+      is_premium: true,
+    });
+
     // Handle Subscription Details
     if (session.subscription) {
       try {
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
-        updateData.stripe_subscription_id = session.subscription;
-        updateData.subscription_status = "active";
-        updateData.current_period_end = new Date(subscription.current_period_end * 1000).toISOString();
+        Object.assign(baseData, {
+          stripe_subscription_id: session.subscription,
+          subscription_status: "active",
+          current_period_end: new Date(subscription.current_period_end * 1000).toISOString()
+        });
       } catch (e) {
         console.error("Failed to retrieve subscription details for upgrade:", e);
       }
     }
   }
 
-  const { error: updateError } = await supabase
+  // --- FIX: USE UPSERT TO CREATE OR UPDATE ---
+  // This bypasses the need to check if user exists first.
+  // If they don't exist, it creates them. If they do, it updates them.
+  const { error: upsertError } = await supabase
     .from("users")
-    .update(updateData)
-    .eq("id", user.id);
+    .upsert(baseData, { onConflict: "id" }); // "id" is the primary key
 
-  if (updateError) {
-    throw new Error("Failed to update users table: " + updateError.message);
+  if (upsertError) {
+    throw new Error("Failed to upsert user: " + upsertError.message);
   }
 
   // Update user_profiles table (optional, keeping it generic as 'premium' or 'free')
   const profilePlan = planType === 'free' ? 'free' : 'premium';
   await supabase
     .from("user_profiles")
-    .update({ plan: profilePlan })
-    .eq("user_id", user.id)
+    .upsert({
+      user_id: userId,
+      plan: profilePlan
+    }, { onConflict: "user_id" }) 
     .then(({ error }) => {
       if (error) console.warn("⚠️ user_profiles update failed:", error.message);
     });
@@ -513,7 +501,7 @@ async function upgradeUser(session) {
   await supabase
     .from("payments")
     .insert({
-      user_id: user.id,
+      user_id: userId,
       stripe_payment_intent_id: paymentIntentId || null,
       stripe_charge_id: chargeId,
       amount: session.amount_total,
@@ -528,17 +516,17 @@ async function upgradeUser(session) {
       if (error) console.error("⚠️ Payment record insert failed:", error.message);
     });
 
-  console.log(`✅ ${planType} unlocked for:`, user.id);
+  console.log(`✅ ${planType} unlocked for:`, userId);
 
   trackAnalytics("user_upgraded", {
-    user_id: user.id,
+    user_id: userId,
     plan: dbPlan,
     amount: session.amount_total
   });
 
   return {
     upgraded: true,
-    user_id: user.id,
+    user_id: userId,
     plan: dbPlan
   };
 }
@@ -566,10 +554,6 @@ app.get("/user/profile", authenticateUser, async (req, res) => {
 app.put("/user/profile", authenticateUser, async (req, res) => {
   try {
     const { nickname, personality, avatar_url } = req.body;
-    
-    // Ensure we update the correct table. 
-    // Based on previous schema analysis, users table has nickname/personality.
-    // profiles table has avatar_url.
     
     // 1. Update users table
     const updates = {};
@@ -919,8 +903,39 @@ app.get("/health", (req, res) => {
 });
 
 // ----------------------------
-// ROUTES: MANUAL PLAN MANAGEMENT
+// ROUTES: PLAN MANAGEMENT
 // ----------------------------
+
+// NEW: GET Route for Frontend Fallback
+app.get("/user/plan", authenticateUser, async (req, res) => {
+  try {
+    // Fetch from users table (using Service Role implicitly via backend auth or direct client)
+    // But we are in the backend context, so we can just use the supabase client directly
+    const { data, error } = await supabase
+      .from("users")
+      .select("plan, is_premium, is_lifetime")
+      .eq("id", req.user.id)
+      .single();
+
+    if (error) {
+        console.error("Error fetching plan via backend:", error);
+        // Fallback to free if error
+        return res.json({ plan: "free" });
+    }
+    
+    // Map DB values to simple strings
+    const planStr = (data.plan || '').toLowerCase();
+    if (data.is_lifetime) return res.json({ plan: "lifetime" });
+    if (data.is_premium) return res.json({ plan: planStr === 'ultimate_yearly' ? 'yearly' : 'monthly' });
+    
+    return res.json({ plan: planStr || "free" });
+
+  } catch (err) {
+    console.error("GET /user/plan error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/user/plan", authenticateUser, async (req, res) => {
   try {
     const { plan } = req.body;
@@ -1010,47 +1025,27 @@ app.get("/verify-session", async (req, res) => {
   }
 
   try {
-    // 1. Retrieve the session from Stripe
     const session = await stripe.checkout.sessions.retrieve(session_id);
 
-    // 2. Check if payment was successful
     if (session.payment_status !== 'paid') {
       return res.status(400).json({ error: "Payment not completed" });
     }
 
-    // 3. Get user details from our DB
     const userId = session.client_reference_id;
     
     if (!userId) {
       return res.status(400).json({ error: "No user associated with session" });
     }
 
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("plan, is_lifetime, is_premium")
-      .eq("id", userId)
-      .single();
-
-    if (error || !user) {
-      // Fallback: If webhook hasn't fired yet, trigger upgrade manually here
-      try {
-        await upgradeUser(session);
-        const planMap = { 'monthly': 'ultimate_monthly', 'yearly': 'ultimate_yearly' };
-        return res.json({ 
-          status: "success", 
-          plan: planMap[session.metadata.product] || user.plan 
-        });
-      } catch (upgradeErr) {
-        console.error("Manual upgrade failed:", upgradeErr);
-        return res.status(500).json({ error: "Failed to verify upgrade" });
-      }
-    }
-
-    // Return the current status
+    // Try to trigger upgrade immediately if webhook hasn't fired
+    // Note: upgradeUser now uses upsert, so it won't crash if user is missing
+    await upgradeUser(session);
+    
+    const planMap = { 'monthly': 'ultimate_monthly', 'yearly': 'ultimate_yearly', 'lifetime': 'lifetime' };
+    
     return res.json({ 
       status: "success", 
-      plan: user.plan,
-      is_lifetime: user.is_lifetime 
+      plan: planMap[session.metadata.product] || 'free' 
     });
 
   } catch (err) {
