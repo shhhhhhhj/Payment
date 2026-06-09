@@ -91,7 +91,7 @@ async function sendEmail(to, subject, htmlContent) {
     console.log("📧 Email sent:", result.id);
     return result;
   } catch (err) {
-    console.error("❌ Resend email error:", err);
+    console.error("❌ Refund error:", err);
   }
 }
 
@@ -322,15 +322,14 @@ app.post("/create-portal-session", async (req, res) => {
   }
 });
 
-app.post("/refund", async (req, res) => {
+app.post("/refund", authenticateUser, async (req, res) => {
   try {
-    const { user_id } = req.body;
-    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+    const userId = req.user.id; // Use authenticated user ID
 
     const { data: user, error: userError } = await supabase
       .from("users")
-      .select("refund_count, last_refund_at, plan")
-      .eq("id", user_id)
+      .select("refund_count, last_refund_at, plan, stripe_subscription_id")
+      .eq("id", userId)
       .single();
 
     if (userError || !user) return res.status(404).json({ error: "User not found" });
@@ -344,7 +343,7 @@ app.post("/refund", async (req, res) => {
     const { data: payment, error: paymentError } = await supabase
       .from("payments")
       .select("*")
-      .eq("user_id", user_id)
+      .eq("user_id", userId)
       .order("created_at", { ascending: false })
       .limit(1)
       .single();
@@ -364,11 +363,24 @@ app.post("/refund", async (req, res) => {
       return res.status(400).json({ error: "No payment intent found associated with this payment." });
     }
 
+    // 1. Process Refund in Stripe
     await stripe.refunds.create({
       payment_intent: payment.stripe_payment_intent_id,
       reason: "requested_by_customer"
     });
 
+    // 2. Cancel Subscription in Stripe if active (CRITICAL FIX)
+    // If we don't do this, they get refunded now but charged again next month.
+    if (user.stripe_subscription_id) {
+      try {
+        await stripe.subscriptions.cancel(user.stripe_subscription_id);
+        console.log(`🚫 Cancelled subscription ${user.stripe_subscription_id} due to refund.`);
+      } catch (subError) {
+        console.warn("⚠️ Warning: Failed to cancel subscription in Stripe during refund:", subError.message);
+      }
+    }
+
+    // 3. Update Payment Record
     await supabase.from("payments")
       .update({
         status: "refunded",
@@ -376,7 +388,8 @@ app.post("/refund", async (req, res) => {
       })
       .eq("id", payment.id);
 
-    await handleRefundReset(user_id);
+    // 4. Reset User Data
+    await handleRefundReset(userId);
 
     res.json({ success: true, message: "Refund processed successfully." });
 
@@ -387,7 +400,7 @@ app.post("/refund", async (req, res) => {
 });
 
 // ----------------------------
-// CORE LOGIC: UPGRADE USER (FIXED)
+// CORE LOGIC: UPGRADE USER
 // ----------------------------
 async function upgradeUser(session) {
   const userId = session.client_reference_id;
@@ -396,7 +409,6 @@ async function upgradeUser(session) {
 
   if (!userId && !email) throw new Error("No user identifier found in session");
 
-  // Base Data for Upsert (Used for both creating new users and updating existing ones)
   const baseData = {
     id: userId,
     email: email,
@@ -407,10 +419,9 @@ async function upgradeUser(session) {
     updated_at: new Date().toISOString(),
   };
 
-  let dbPlan = "premium"; // Default
+  let dbPlan = "premium"; 
   let productName = "Premium Subscription";
 
-  // Determine Plan Specifics
   if (planType === "lifetime") {
     dbPlan = "lifetime";
     productName = "Lifetime Plan";
@@ -422,68 +433,41 @@ async function upgradeUser(session) {
       subscription_status: null,
       current_period_end: null
     });
-  } else if (planType === "monthly") {
-    dbPlan = "ultimate_monthly";
-    productName = "Ultimate Monthly";
+  } else if (planType === "monthly" || planType === "yearly") {
+    // Handle both subscription types with shared logic
+    dbPlan = planType === 'monthly' ? 'ultimate_monthly' : 'ultimate_yearly';
+    productName = planType === 'monthly' ? 'Ultimate Monthly' : 'Ultimate Yearly';
+    
     Object.assign(baseData, {
-      plan: "ultimate_monthly",
+      plan: dbPlan,
       is_lifetime: false,
       is_premium: true,
     });
     
-    // Handle Subscription Details
     if (session.subscription) {
       try {
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
         Object.assign(baseData, {
-  stripe_subscription_id: session.subscription,
-  subscription_status: subscription.status,
-  current_period_end: subscription.current_period_end
-    ? new Date(subscription.current_period_end * 1000).toISOString()
-    : null,
-});
-      } catch (e) {
-        console.error("Failed to retrieve subscription details for upgrade:", e);
-      }
-    }
-  } else if (planType === "yearly") {
-    dbPlan = "ultimate_yearly";
-    productName = "Ultimate Yearly";
-    Object.assign(baseData, {
-      plan: "ultimate_yearly",
-      is_lifetime: false,
-      is_premium: true,
-    });
-
-    // Handle Subscription Details
-    if (session.subscription) {
-      try {
-        const subscription = await stripe.subscriptions.retrieve(session.subscription);
-        Object.assign(baseData, {
-  stripe_subscription_id: session.subscription,
-  subscription_status: subscription.status,
-  current_period_end: subscription.current_period_end
-    ? new Date(subscription.current_period_end * 1000).toISOString()
-    : null,
-});
+          stripe_subscription_id: session.subscription,
+          subscription_status: subscription.status,
+          current_period_end: subscription.current_period_end
+            ? new Date(subscription.current_period_end * 1000).toISOString()
+            : null,
+        });
       } catch (e) {
         console.error("Failed to retrieve subscription details for upgrade:", e);
       }
     }
   }
 
-  // --- FIX: USE UPSERT TO CREATE OR UPDATE ---
-  // This bypasses the need to check if user exists first.
-  // If they don't exist, it creates them. If they do, it updates them.
   const { error: upsertError } = await supabase
     .from("users")
-    .upsert(baseData, { onConflict: "id" }); // "id" is the primary key
+    .upsert(baseData, { onConflict: "id" });
 
   if (upsertError) {
     throw new Error("Failed to upsert user: " + upsertError.message);
   }
 
-  // Update user_profiles table (optional, keeping it generic as 'premium' or 'free')
   const profilePlan = planType === 'free' ? 'free' : 'premium';
   await supabase
     .from("user_profiles")
@@ -540,6 +524,9 @@ async function upgradeUser(session) {
 // ----------------------------
 
 app.get("/user/profile", authenticateUser, async (req, res) => {
+  // Disable caching for this endpoint so updates reflect immediately
+  res.setHeader('Cache-Control', 'no-store');
+  
   try {
     const { data, error } = await supabase
       .from("users")
@@ -559,12 +546,10 @@ app.put("/user/profile", authenticateUser, async (req, res) => {
   try {
     const { nickname, personality, avatar_url } = req.body;
     
-    // 1. Update users table
     const updates = {};
     if (nickname) updates.nickname = nickname;
     if (personality) updates.personality = personality;
     
-    // 2. Update profiles table
     if (avatar_url) {
         await supabase.from("profiles").update({ avatar_url })
           .eq("id", req.user.id);
@@ -576,7 +561,6 @@ app.put("/user/profile", authenticateUser, async (req, res) => {
         if (error) throw error;
     }
     
-    // Fetch and return updated data
     const { data, error: fetchError } = await supabase
       .from("users")
       .select("id, email, plan, is_premium, is_lifetime")
@@ -802,202 +786,196 @@ app.get("/admin/audit-logs", authenticateUser, requireAdmin, async (req, res) =>
 });
 
 // ----------------------------
-// WEBHOOKS
+// WEBHOOKS (FIXED & CONSOLIDATED)
 // ----------------------------
 app.post("/stripe-webhook", async (req, res) => {
   const sig = req.headers["stripe-signature"];
   if (!sig) return res.status(400).send("Missing signature");
 
+  let event;
   try {
-    const event = stripe.webhooks.constructEvent(
+    event = stripe.webhooks.constructEvent(
       req.body,
       sig,
       process.env.STRIPE_WEBHOOK_SECRET
     );
+  } catch (err) {
+    console.error("❌ Webhook signature verification failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
 
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      try {
-        const result = await upgradeUser(session);
-        if (result.already_upgraded) {
-          console.log("ℹ️ Webhook: already upgraded:", result.user_id);
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        try {
+          const result = await upgradeUser(session);
+          console.log("✅ Webhook: checkout.session.completed processed", result.user_id);
+        } catch (err) {
+          console.error("❌ Webhook upgrade failed:", err.message);
         }
-      } catch (err) {
-        console.error("❌ Webhook upgrade failed:", err.message);
+        break;
       }
-    }
 
-    // ----------------------------
-// SUBSCRIPTION UPDATED
-// ----------------------------
+      case "customer.subscription.updated": {
+        const subscription = event.data.object;
+        try {
+          const { data: user } = await supabase
+            .from("users")
+            .select("id")
+            .eq("stripe_subscription_id", subscription.id)
+            .single();
 
-if (event.type === "customer.subscription.updated") {
-  const subscription = event.data.object;
-
-  try {
-    const { data: user } = await supabase
-      .from("users")
-      .select("id")
-      .eq("stripe_subscription_id", subscription.id)
-      .single();
-
-    if (user) {
-      await supabase
-        .from("users")
-        .update({
-          subscription_status: subscription.status,
-          current_period_end: subscription.current_period_end
-            ? new Date(subscription.current_period_end * 1000).toISOString()
-            : null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", user.id);
-
-      if (
-        ["unpaid", "incomplete_expired"].includes(subscription.status)
-      ) {
-        await handleSubscriptionCancellation(user.id);
-      }
-    }
-  } catch (err) {
-    console.error(
-      "❌ customer.subscription.updated:",
-      err.message
-    );
-  }
-}
-
-// ----------------------------
-// PAYMENT FAILED
-// ----------------------------
-
-if (event.type === "invoice.payment_failed") {
-  const invoice = event.data.object;
-
-  try {
-    if (invoice.subscription) {
-      await supabase
-        .from("users")
-        .update({
-          subscription_status: "past_due",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("stripe_subscription_id", invoice.subscription);
-    }
-
-    trackAnalytics("recurring_payment_failed", {
-      amount: invoice.amount_due,
-      currency: invoice.currency,
-      subscription_id: invoice.subscription,
-    });
-  } catch (err) {
-    console.error(
-      "❌ invoice.payment_failed:",
-      err.message
-    );
-  }
-}
-
-// ----------------------------
-// PAYMENT SUCCEEDED
-// ----------------------------
-
-if (event.type === "invoice.payment_succeeded") {
-  const invoice = event.data.object;
-
-  try {
-    if (invoice.subscription) {
-      await supabase
-        .from("users")
-        .update({
-          subscription_status: "active",
-          updated_at: new Date().toISOString(),
-        })
-        .eq("stripe_subscription_id", invoice.subscription);
-    }
-
-    trackAnalytics("recurring_payment_success", {
-      amount: invoice.amount_paid,
-      currency: invoice.currency,
-      subscription_id: invoice.subscription,
-    });
-  } catch (err) {
-    console.error(
-      "❌ invoice.payment_succeeded:",
-      err.message
-    );
-  }
-}
-
-    if (event.type === "charge.refunded") {
-      const charge = event.data.object;
-      const paymentIntentId = charge.payment_intent;
-
-      const { data: payment } = await supabase
-        .from("payments")
-        .select("user_id")
-        .eq("stripe_payment_intent_id", paymentIntentId)
-        .single();
-
-      if (payment && payment.user_id) {
-        const { data: user } = await supabase
-          .from("users")
-          .select("refund_count")
-          .eq("id", payment.user_id)
-          .single();
-
-        if (user && user.refund_count < 1) {
-          await handleRefundReset(payment.user_id);
-        } else {
-          console.log(`ℹ️ Webhook: Refund occurred for user ${payment.user_id}, but refund count is ${user?.refund_count}. Status not reset.`);
+          if (user) {
+            // If subscription moves to unpaid states, handle cancellation
+            if (["unpaid", "incomplete_expired"].includes(subscription.status)) {
+              await handleSubscriptionCancellation(user.id);
+            } else {
+              // Otherwise just update status
+              await supabase
+                .from("users")
+                .update({
+                  subscription_status: subscription.status,
+                  current_period_end: subscription.current_period_end
+                    ? new Date(subscription.current_period_end * 1000).toISOString()
+                    : null,
+                  updated_at: new Date().toISOString(),
+                })
+                .eq("id", user.id);
+            }
+          }
+        } catch (err) {
+          console.error("❌ customer.subscription.updated error:", err.message);
         }
+        break;
       }
-    }
 
-    if (event.type === "customer.subscription.deleted") {
-      const subscription = event.data.object;
-      const customerId = subscription.customer;
-      const { data: user } = await supabase
-        .from("users")
-        .select("id")
-        .eq("stripe_customer_id", customerId)
-        .single();
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object;
+        const customerId = subscription.customer;
+        try {
+          const { data: user } = await supabase
+            .from("users")
+            .select("id")
+            .eq("stripe_customer_id", customerId)
+            .single();
 
-      if (user) {
-        await handleSubscriptionCancellation(user.id);
+          if (user) {
+            await handleSubscriptionCancellation(user.id);
+          }
+        } catch (err) {
+          console.error("❌ customer.subscription.deleted error:", err.message);
+        }
+        break;
       }
-    }
 
-    if (event.type === "customer.subscription.trial_will_end") {
-      const subscription = event.data.object;
-      const customerId = subscription.customer;
-      const customer = await stripe.customers.retrieve(customerId);
-      const email = customer.email;
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+        try {
+          if (invoice.subscription) {
+            await supabase
+              .from("users")
+              .update({
+                subscription_status: "past_due",
+                updated_at: new Date().toISOString(),
+              })
+              .eq("stripe_subscription_id", invoice.subscription);
+          }
 
-      let planName = "Subscription";
-      if (subscription.items.data[0].price.id === process.env.STRIPE_MONTHLY_PRICE_ID) planName = "Ultimate Monthly";
-      else if (subscription.items.data[0].price.id === process.env.STRIPE_YEARLY_PRICE_ID) planName = "Ultimate Yearly";
+          trackAnalytics("recurring_payment_failed", {
+            amount: invoice.amount_due,
+            currency: invoice.currency,
+            subscription_id: invoice.subscription,
+          });
+        } catch (err) {
+          console.error("❌ invoice.payment_failed error:", err.message);
+        }
+        break;
+      }
 
-      console.log(`📧 Trial ending for ${email}`);
-      await sendTrialEndingEmail(email, planName, subscription.trial_end);
-      trackAnalytics("trial_ending_scheduled", { email, plan: planName, ends_at: subscription.trial_end });
-    }
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+        try {
+          if (invoice.subscription) {
+            await supabase
+              .from("users")
+              .update({
+                subscription_status: "active",
+                updated_at: new Date().toISOString(),
+              })
+              .eq("stripe_subscription_id", invoice.subscription);
+          }
 
-    if (event.type === "invoice.payment_succeeded") {
-      const invoice = event.data.object;
-      trackAnalytics("recurring_payment_success", { amount: invoice.amount_paid, currency: invoice.currency });
-    }
+          trackAnalytics("recurring_payment_success", {
+            amount: invoice.amount_paid,
+            currency: invoice.currency,
+            subscription_id: invoice.subscription,
+          });
+        } catch (err) {
+          console.error("❌ invoice.payment_succeeded error:", err.message);
+        }
+        break;
+      }
 
-    if (event.type === "invoice.payment_failed") {
-      const invoice = event.data.object;
-      trackAnalytics("rrecurring_payment_failed", { amount: invoice.amount_due, currency: invoice.currency });
+      case "charge.refunded": {
+        const charge = event.data.object;
+        const paymentIntentId = charge.payment_intent;
+        try {
+          const { data: payment } = await supabase
+            .from("payments")
+            .select("user_id")
+            .eq("stripe_payment_intent_id", paymentIntentId)
+            .single();
+
+          if (payment && payment.user_id) {
+            const { data: user } = await supabase
+              .from("users")
+              .select("refund_count")
+              .eq("id", payment.user_id)
+              .single();
+
+            // Only reset if they haven't used their refund yet
+            if (user && user.refund_count < 1) {
+              await handleRefundReset(payment.user_id);
+            } else {
+              console.log(`ℹ️ Webhook: Refund occurred for user ${payment.user_id}, but refund count is ${user?.refund_count}. Status not reset.`);
+            }
+          }
+        } catch (err) {
+          console.error("❌ charge.refunded error:", err.message);
+        }
+        break;
+      }
+
+      case "customer.subscription.trial_will_end": {
+        const subscription = event.data.object;
+        const customerId = subscription.customer;
+        try {
+          const customer = await stripe.customers.retrieve(customerId);
+          const email = customer.email;
+
+          let planName = "Subscription";
+          // Ensure Price IDs match your environment variables
+          if (subscription.items.data[0].price.id === process.env.STRIPE_MONTHLY_PRICE_ID) planName = "Ultimate Monthly";
+          else if (subscription.items.data[0].price.id === process.env.STRIPE_YEARLY_PRICE_ID) planName = "Ultimate Yearly";
+
+          console.log(`📧 Trial ending for ${email}`);
+          await sendTrialEndingEmail(email, planName, subscription.trial_end);
+          trackAnalytics("trial_ending_scheduled", { email, plan: planName, ends_at: subscription.trial_end });
+        } catch (err) {
+          console.error("❌ trial_will_end error:", err.message);
+        }
+        break;
+      }
+
+      default:
+        console.log(`🔔 Unhandled webhook event: ${event.type}`);
     }
 
     res.sendStatus(200);
-
   } catch (err) {
-    console.error("❌ Webhook error:", err.message);
-    res.status(400).send(`Webhook Error: ${err.message}`);
+    console.error("❌ Webhook processing error:", err.message);
+    res.status(500).send(`Webhook Error: ${err.message}`);
   }
 });
 
@@ -1012,11 +990,11 @@ app.get("/health", (req, res) => {
 // ROUTES: PLAN MANAGEMENT
 // ----------------------------
 
-// NEW: GET Route for Frontend Fallback
 app.get("/user/plan", authenticateUser, async (req, res) => {
+  // Disable caching for plan updates
+  res.setHeader('Cache-Control', 'no-store');
+
   try {
-    // Fetch from users table (using Service Role implicitly via backend auth or direct client)
-    // But we are in the backend context, so we can just use the supabase client directly
     const { data, error } = await supabase
       .from("users")
       .select("plan, is_premium, is_lifetime")
@@ -1025,11 +1003,9 @@ app.get("/user/plan", authenticateUser, async (req, res) => {
 
     if (error) {
         console.error("Error fetching plan via backend:", error);
-        // Fallback to free if error
         return res.json({ plan: "free" });
     }
     
-    // Map DB values to simple strings
     const planStr = (data.plan || '').toLowerCase();
     if (data.is_lifetime) return res.json({ plan: "lifetime" });
     if (data.is_premium) return res.json({ plan: planStr === 'ultimate_yearly' ? 'yearly' : 'monthly' });
@@ -1143,8 +1119,6 @@ app.get("/verify-session", async (req, res) => {
       return res.status(400).json({ error: "No user associated with session" });
     }
 
-    // Try to trigger upgrade immediately if webhook hasn't fired
-    // Note: upgradeUser now uses upsert, so it won't crash if user is missing
     await upgradeUser(session);
     
     const planMap = { 'monthly': 'ultimate_monthly', 'yearly': 'ultimate_yearly', 'lifetime': 'lifetime' };
