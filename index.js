@@ -869,30 +869,6 @@ app.post("/stripe-webhook", async (req, res) => {
         break;
       }
 
-      case "invoice.payment_failed": {
-        const invoice = event.data.object;
-        try {
-          if (invoice.subscription) {
-            await supabase
-              .from("users")
-              .update({
-                subscription_status: "past_due",
-                updated_at: new Date().toISOString(),
-              })
-              .eq("stripe_subscription_id", invoice.subscription);
-          }
-
-          trackAnalytics("recurring_payment_failed", {
-            amount: invoice.amount_due,
-            currency: invoice.currency,
-            subscription_id: invoice.subscription,
-          });
-        } catch (err) {
-          console.error("❌ invoice.payment_failed error:", err.message);
-        }
-        break;
-      }
-
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
         try {
