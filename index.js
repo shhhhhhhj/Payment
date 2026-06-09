@@ -823,6 +823,108 @@ app.post("/stripe-webhook", async (req, res) => {
       }
     }
 
+    // ----------------------------
+// SUBSCRIPTION UPDATED
+// ----------------------------
+
+if (event.type === "customer.subscription.updated") {
+  const subscription = event.data.object;
+
+  try {
+    const { data: user } = await supabase
+      .from("users")
+      .select("id")
+      .eq("stripe_subscription_id", subscription.id)
+      .single();
+
+    if (user) {
+      await supabase
+        .from("users")
+        .update({
+          subscription_status: subscription.status,
+          current_period_end: subscription.current_period_end
+            ? new Date(subscription.current_period_end * 1000).toISOString()
+            : null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", user.id);
+
+      if (
+        ["unpaid", "incomplete_expired"].includes(subscription.status)
+      ) {
+        await handleSubscriptionCancellation(user.id);
+      }
+    }
+  } catch (err) {
+    console.error(
+      "❌ customer.subscription.updated:",
+      err.message
+    );
+  }
+}
+
+// ----------------------------
+// PAYMENT FAILED
+// ----------------------------
+
+if (event.type === "invoice.payment_failed") {
+  const invoice = event.data.object;
+
+  try {
+    if (invoice.subscription) {
+      await supabase
+        .from("users")
+        .update({
+          subscription_status: "past_due",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("stripe_subscription_id", invoice.subscription);
+    }
+
+    trackAnalytics("recurring_payment_failed", {
+      amount: invoice.amount_due,
+      currency: invoice.currency,
+      subscription_id: invoice.subscription,
+    });
+  } catch (err) {
+    console.error(
+      "❌ invoice.payment_failed:",
+      err.message
+    );
+  }
+}
+
+// ----------------------------
+// PAYMENT SUCCEEDED
+// ----------------------------
+
+if (event.type === "invoice.payment_succeeded") {
+  const invoice = event.data.object;
+
+  try {
+    if (invoice.subscription) {
+      await supabase
+        .from("users")
+        .update({
+          subscription_status: "active",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("stripe_subscription_id", invoice.subscription);
+    }
+
+    trackAnalytics("recurring_payment_success", {
+      amount: invoice.amount_paid,
+      currency: invoice.currency,
+      subscription_id: invoice.subscription,
+    });
+  } catch (err) {
+    console.error(
+      "❌ invoice.payment_succeeded:",
+      err.message
+    );
+  }
+}
+
     if (event.type === "charge.refunded") {
       const charge = event.data.object;
       const paymentIntentId = charge.payment_intent;
