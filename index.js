@@ -436,10 +436,12 @@ async function upgradeUser(session) {
       try {
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
         Object.assign(baseData, {
-          stripe_subscription_id: session.subscription,
-          subscription_status: "active",
-          current_period_end: new Date(subscription.current_period_end * 1000).toISOString()
-        });
+  stripe_subscription_id: session.subscription,
+  subscription_status: subscription.status,
+  current_period_end: subscription.current_period_end
+    ? new Date(subscription.current_period_end * 1000).toISOString()
+    : null,
+});
       } catch (e) {
         console.error("Failed to retrieve subscription details for upgrade:", e);
       }
@@ -458,10 +460,12 @@ async function upgradeUser(session) {
       try {
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
         Object.assign(baseData, {
-          stripe_subscription_id: session.subscription,
-          subscription_status: "active",
-          current_period_end: new Date(subscription.current_period_end * 1000).toISOString()
-        });
+  stripe_subscription_id: session.subscription,
+  subscription_status: subscription.status,
+  current_period_end: subscription.current_period_end
+    ? new Date(subscription.current_period_end * 1000).toISOString()
+    : null,
+});
       } catch (e) {
         console.error("Failed to retrieve subscription details for upgrade:", e);
       }
