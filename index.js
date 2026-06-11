@@ -13,7 +13,7 @@ const app = express();
 // Security Headers
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "lifetime");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN"); // Fixed invalid "lifetime" value
   res.setHeader("X-XSS-Protection", "1; mode=block");
   next();
 });
@@ -91,7 +91,7 @@ async function sendEmail(to, subject, htmlContent) {
     console.log("📧 Email sent:", result.id);
     return result;
   } catch (err) {
-    console.error("❌ Refund error:", err);
+    console.error("❌ Email send error:", err);
   }
 }
 
@@ -101,6 +101,18 @@ async function sendTrialEndingEmail(email, plan, endDate) {
     <p>Hi there,</p>
     <p>Your <strong>${plan}</strong> trial ends on <strong>${new Date(endDate * 1000).toLocaleDateString()}</strong>.</p>
     <p>Your payment method will be charged automatically unless you cancel.</p>
+    <br>
+    <p>Best,<br>The HeloxAi Team</p>
+  `;
+  await sendEmail(email, subject, html);
+}
+
+async function sendPaymentFailedEmail(email, plan) {
+  const subject = "Action Required: Payment Failed for HeloxAi";
+  const html = `
+    <p>Hi there,</p>
+    <p>We attempted to process your payment for your <strong>${plan}</strong> subscription, but it failed.</p>
+    <p>Please update your payment method to avoid losing access to premium features.</p>
     <br>
     <p>Best,<br>The HeloxAi Team</p>
   `;
@@ -369,8 +381,7 @@ app.post("/refund", authenticateUser, async (req, res) => {
       reason: "requested_by_customer"
     });
 
-    // 2. Cancel Subscription in Stripe if active (CRITICAL FIX)
-    // If we don't do this, they get refunded now but charged again next month.
+    // 2. Cancel Subscription in Stripe if active
     if (user.stripe_subscription_id) {
       try {
         await stripe.subscriptions.cancel(user.stripe_subscription_id);
@@ -786,7 +797,7 @@ app.get("/admin/audit-logs", authenticateUser, requireAdmin, async (req, res) =>
 });
 
 // ----------------------------
-// WEBHOOKS (FIXED & CONSOLIDATED)
+// WEBHOOKS (UPDATED)
 // ----------------------------
 app.post("/stripe-webhook", async (req, res) => {
   const sig = req.headers["stripe-signature"];
@@ -830,6 +841,16 @@ app.post("/stripe-webhook", async (req, res) => {
             // If subscription moves to unpaid states, handle cancellation
             if (["unpaid", "incomplete_expired"].includes(subscription.status)) {
               await handleSubscriptionCancellation(user.id);
+            } else if (subscription.status === "past_due") {
+              // Update status to past_due but do not cancel yet (allow retries)
+               await supabase
+                .from("users")
+                .update({
+                  subscription_status: "past_due",
+                  updated_at: new Date().toISOString(),
+                })
+                .eq("id", user.id);
+               console.log(`⚠️ Subscription ${subscription.id} is past_due.`);
             } else {
               // Otherwise just update status
               await supabase
@@ -893,6 +914,41 @@ app.post("/stripe-webhook", async (req, res) => {
         break;
       }
 
+      // NEW: Handle Failed Payments
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+        try {
+          const customerId = invoice.customer;
+          const { data: user } = await supabase
+            .from("users")
+            .select("id, email, plan")
+            .eq("stripe_customer_id", customerId)
+            .single();
+
+          if (user) {
+            // Update status to reflect payment failure
+            if (invoice.subscription) {
+              await supabase
+                .from("users")
+                .update({
+                  subscription_status: "past_due",
+                  updated_at: new Date().toISOString(),
+                })
+                .eq("id", user.id);
+            }
+
+            // Notify user
+            console.log(`⚠️ Payment failed for user ${user.id}`);
+            await sendPaymentFailedEmail(user.email, user.plan || "Subscription");
+            
+            trackAnalytics("payment_failed", { user_id: user.id, subscription_id: invoice.subscription });
+          }
+        } catch (err) {
+          console.error("❌ invoice.payment_failed error:", err.message);
+        }
+        break;
+      }
+
       case "charge.refunded": {
         const charge = event.data.object;
         const paymentIntentId = charge.payment_intent;
@@ -931,7 +987,6 @@ app.post("/stripe-webhook", async (req, res) => {
           const email = customer.email;
 
           let planName = "Subscription";
-          // Ensure Price IDs match your environment variables
           if (subscription.items.data[0].price.id === process.env.STRIPE_MONTHLY_PRICE_ID) planName = "Ultimate Monthly";
           else if (subscription.items.data[0].price.id === process.env.STRIPE_YEARLY_PRICE_ID) planName = "Ultimate Yearly";
 
