@@ -82,16 +82,30 @@ async function sendEmail(to, subject, htmlContent) {
       console.warn("⚠️ FROM_EMAIL not set, skipping email.");
       return;
     }
+
     const result = await resend.emails.send({
       from: process.env.FROM_EMAIL,
       to,
       subject,
       html: htmlContent,
     });
-    console.log("📧 Email sent:", result.id);
+
+    // Resend SDK returns { data: { id: '...' }, error: ... }
+    if (result.error) {
+      console.error("❌ Resend API Error:", result.error);
+      return;
+    }
+
+    if (!result.data || !result.data.id) {
+      console.error("❌ Email sent but no ID returned:", result);
+      return;
+    }
+
+    console.log("📧 Email sent:", result.data.id);
     return result;
+    
   } catch (err) {
-    console.error("❌ Email send error:", err);
+    console.error("❌ Email send error (Exception):", err);
   }
 }
 
