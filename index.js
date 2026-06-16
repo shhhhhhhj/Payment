@@ -904,24 +904,43 @@ app.post("/stripe-webhook", async (req, res) => {
         break;
       }
 
-      case "invoice.payment_succeeded": {
+            case "invoice.payment_succeeded": {
         const invoice = event.data.object;
         try {
           if (invoice.subscription) {
-            await supabase
+            // We need to know what plan they are on to restore the correct labels
+            const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
+            const priceId = subscription.items.data[0].price.id;
+            
+            let dbPlan = "premium";
+            if (priceId === process.env.STRIPE_YEARLY_PRICE_ID) dbPlan = "ultimate_yearly";
+            else if (priceId === process.env.STRIPE_MONTHLY_PRICE_ID) dbPlan = "ultimate_monthly";
+
+            // Restore access
+            const { error } = await supabase
               .from("users")
               .update({
                 subscription_status: "active",
+                is_premium: true, // <--- CRITICAL: Restore premium status
+                plan: dbPlan,
                 updated_at: new Date().toISOString(),
               })
               .eq("stripe_subscription_id", invoice.subscription);
-          }
+              
+            // Also update user_profiles
+            if (!error) {
+                await supabase
+                  .from("user_profiles")
+                  .update({ plan: "premium" })
+                  .eq("user_id", (await supabase.from("users").select("id").eq("stripe_subscription_id", invoice.subscription).single()).data?.id);
+            }
 
-          trackAnalytics("recurring_payment_success", {
-            amount: invoice.amount_paid,
-            currency: invoice.currency,
-            subscription_id: invoice.subscription,
-          });
+            trackAnalytics("recurring_payment_success", {
+              amount: invoice.amount_paid,
+              currency: invoice.currency,
+              subscription_id: invoice.subscription,
+            });
+          }
         } catch (err) {
           console.error("❌ invoice.payment_succeeded error:", err.message);
         }
@@ -929,29 +948,44 @@ app.post("/stripe-webhook", async (req, res) => {
       }
 
       // NEW: Handle Failed Payments
-      case "invoice.payment_failed": {
+           case "invoice.payment_failed": {
         const invoice = event.data.object;
         try {
           const customerId = invoice.customer;
           const { data: user } = await supabase
             .from("users")
-            .select("id, email, plan")
+            .select("id, email, plan, stripe_subscription_id")
             .eq("stripe_customer_id", customerId)
             .single();
 
           if (user) {
-            // Update status to reflect payment failure
-            if (invoice.subscription) {
-              await supabase
-                .from("users")
-                .update({
-                  subscription_status: "past_due",
-                  updated_at: new Date().toISOString(),
-                })
-                .eq("id", user.id);
+            // 1. Revoke Premium Access immediately
+            const { error: updateError } = await supabase
+              .from("users")
+              .update({
+                subscription_status: "past_due",
+                is_premium: false,
+                is_lifetime: false,
+                plan: "free", // Reset plan to free
+                // We DO NOT set stripe_subscription_id to null here.
+                // We keep it so Stripe can still retry the payment automatically.
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", user.id);
+
+            if (updateError) {
+              console.error("❌ Failed to revoke premium access:", updateError.message);
+            } else {
+              console.log(`🚫 Revoked premium access for user ${user.id} due to failed payment.`);
             }
 
-            // Notify user
+            // 2. Update user_profiles as well to keep them in sync
+            await supabase
+              .from("user_profiles")
+              .update({ plan: "free" })
+              .eq("user_id", user.id);
+
+            // 3. Notify user
             console.log(`⚠️ Payment failed for user ${user.id}`);
             await sendPaymentFailedEmail(user.email, user.plan || "Subscription");
             
