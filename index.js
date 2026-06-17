@@ -252,6 +252,20 @@ app.post("/create-checkout-session", async (req, res) => {
       return res.status(400).json({ error: "Missing user_id, email, or plan" });
     }
 
+    // 1. Fetch User to check trial status
+    const { data: user, error: userError } = await supabase
+      .from("users")
+      .select("has_used_trial")
+      .eq("id", user_id)
+      .single();
+
+    if (userError) {
+      console.error("❌ Error fetching user for checkout:", userError);
+      // Proceed with default (no trial) if fetch fails, to be safe
+    }
+
+    const hasUsedTrial = user?.has_used_trial || false;
+
     let line_item;
     let mode;
     let product_name;
@@ -300,17 +314,36 @@ app.post("/create-checkout-session", async (req, res) => {
       cancel_url: `${process.env.FRONTEND_URL}/prem.html?cancelled=true`
     };
 
+    // 2. Handle Trial Logic (Only if subscription AND user hasn't used trial)
     if (mode === 'subscription') {
       sessionConfig.subscription_data = {};
-      if (plan === 'monthly') {
-        sessionConfig.subscription_data.trial_period_days = 3;
-      } else if (plan === 'yearly') {
-        sessionConfig.subscription_data.trial_period_days = 7;
+      
+      // Check if trial is allowed
+      if (!hasUsedTrial) {
+        if (plan === 'monthly') {
+          sessionConfig.subscription_data.trial_period_days = 3;
+        } else if (plan === 'yearly') {
+          sessionConfig.subscription_data.trial_period_days = 7;
+        }
+
+        // 3. Mark trial as used IMMEDIATELY so they can't spam the button
+        // We do this here before they even pay, to prevent race conditions
+        try {
+          await supabase
+            .from("users")
+            .update({ has_used_trial: true })
+            .eq("id", user_id);
+          console.log(`✅ Marked trial as used for user ${user_id}`);
+        } catch (updateErr) {
+          console.error("⚠️ Warning: Could not update has_used_trial flag:", updateErr);
+        }
+      } else {
+        console.log(`ℹ️ User ${user_id} has already used a trial. Charging full price for ${plan}.`);
       }
     }
 
     const session = await stripe.checkout.sessions.create(sessionConfig);
-    trackAnalytics("checkout_session_created", { user_id, plan, mode });
+    trackAnalytics("checkout_session_created", { user_id, plan, mode, trial_applied: !hasUsedTrial && mode === 'subscription' });
     res.json({ url: session.url });
 
   } catch (err) {
